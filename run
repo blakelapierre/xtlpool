@@ -4,4 +4,4 @@ docker run -d --rm --name redis -v $(pwd)/redis-data:/data redis:alpine
 docker run -d --rm --name daemon -v $(pwd)/daemon-data:/daemon-data blakelapierre/xtlpool-daemon
 docker run -d --rm --name wallet --link daemon -v $(pwd)/wallet-data:/wallet-data blakelapierre/xtlpool-wallet
 docker run -d --rm --name www -p 80:80 blakelapierre/xtlpool-www
-docker run -d --rm --name pool --link redis --link daemon --link wallet -p 8117:8117 -p 3333:3333 -p 9999:9999 blakelapierre/xtlpool-pool
+docker run -d --rm --name pool --link redis --link daemon -p 8117:8117 -p 3333:3333 -p 9999:9999 blakelapierre/xtlpool-pool
