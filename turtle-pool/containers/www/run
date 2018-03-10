@@ -1,3 +1,0 @@
-#!/bin/sh
-
-docker run -it --rm --name turtlepool-www -p 8080:80 blakelapierre/turtlepool-www

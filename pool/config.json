@@ -1,8 +1,8 @@
 {
-    "coin": "turtlecoin",
-    "symbol": "TRTL",
+    "coin": "stellite",
+    "symbol": "XTL",
     "coinUnits": 100,
-    "coinDifficultyTarget": 30,
+    "coinDifficultyTarget": 60,
 
     "logging": {
         "files": {
@@ -19,7 +19,7 @@
     "poolServer": {
         "enabled": true,
         "clusterForks": "auto",
-        "poolAddress": "TRTLv1W1So77yGbVtrgf8G4epg5Fhq9hEZvpZC8ev86xRVLYsQQMHrxQG92QVjUU3bcE6ThGw9vSbEHBMejJpexE2sdrTC24ZXR",
+        "poolAddress": "Se31xtpSdztCAmrDVd8zmp7TCFtHm1LjrQx9zUgi6rByS6iQTP6T2FY1vhxcRMPURx9sYXTqTWCxuPE6aKbwHHhT1WYcsKDWy",
         "blockRefreshInterval": 100,
         "minerTimeout": 9000,
         "ports": [
@@ -93,17 +93,17 @@
     },
 
     "daemon": {
-        "host": "turtlepool-daemon",
-        "port": 11898
+        "host": "daemon",
+        "port": 8888
     },
 
     "wallet": {
-        "host": "turtlepool-wallet",
-        "port": 8070
+        "host": "wallet",
+        "port": 7777
     },
 
     "redis": {
-        "host": "turtlepool-redis",
+        "host": "redis",
         "port": 6379
     },
 

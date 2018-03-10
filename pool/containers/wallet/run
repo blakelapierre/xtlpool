@@ -1,0 +1,3 @@
+#!/bin/sh
+
+docker run -it --rm --name wallet --link daemon -v $(pwd)/wallet-data:/wallet-data -p 8070:8070 blakelapierre/xtlpool-wallet

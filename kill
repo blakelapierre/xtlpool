@@ -1,7 +1,7 @@
 #!/bin/sh
 
-docker kill turtlepool-redis
-docker kill turtlepool-daemon
-docker kill turtlepool-wallet
-docker kill turtlepool-pool
-docker kill turtlepool-www
+docker kill redis
+docker kill daemon
+docker kill wallet
+docker kill pool
+docker kill www

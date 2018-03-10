@@ -1,3 +1,0 @@
-#!/bin/sh
-
-docker run -it --rm --name turtlepool-wallet --link turtlepool-daemon -v $(pwd)/wallet-data:/wallet-data -p 8070:8070 blakelapierre/turtlepool-wallet

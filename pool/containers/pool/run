@@ -1,0 +1,3 @@
+#!/bin/sh
+
+docker run -it --rm --name pool --link daemon --link wallet --link redis -p 8117:8117 -p 3333:3333 blakelapierre/xtlpool-pool

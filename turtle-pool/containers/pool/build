@@ -1,5 +1,0 @@
-#!/bin/sh
-
-cp ../../config.json config.json
-
-docker build . -t blakelapierre/turtlepool-pool
