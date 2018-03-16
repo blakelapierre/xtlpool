@@ -7,11 +7,6 @@ var bignum = require('bignum');
 var multiHashing = require('multi-hashing');
 var cnUtil = require('cryptonote-util');
 
-// Must exactly be 8 hex chars, already lowercased before test
-var noncePattern = new RegExp("^[0-9a-f]{8}$");
-
-//SSL for claymore
-var tls = require('tls');
 
 var threadId = '(Thread ' + process.env.forkId + ') ';
 
@@ -20,9 +15,6 @@ require('./exceptionWriter.js')(logSystem);
 
 var apiInterfaces = require('./apiInterfaces.js')(config.daemon, config.wallet, config.api);
 var utils = require('./utils.js');
-Buffer.prototype.toByteArray = function () {
-  return Array.prototype.slice.call(this, 0)
-}
 
 var log = function(severity, system, text, data){
     global.log(severity, system, threadId + text, data);
@@ -36,13 +28,10 @@ var instanceId = crypto.randomBytes(4);
 
 var validBlockTemplates = [];
 var currentBlockTemplate;
-var currentBlockHeight = 0;
-var currentBlockHash = "";
 
 var connectedMiners = {};
 
 var bannedIPs = {};
-var perIPStats = {};
 
 var shareTrustEnabled = config.poolServer.shareTrust && config.poolServer.shareTrust.enabled;
 var shareTrustStepFloat = shareTrustEnabled ? config.poolServer.shareTrust.stepDown / 100 : 0;
@@ -50,6 +39,9 @@ var shareTrustMinFloat = shareTrustEnabled ? config.poolServer.shareTrust.min / 
 
 
 var banningEnabled = config.poolServer.banning && config.poolServer.banning.enabled;
+
+var addressBase58Prefix = cnUtil.address_decode(new Buffer(config.poolServer.poolAddress));
+
 
 setInterval(function(){
     var now = Date.now() / 1000 | 0;
@@ -79,7 +71,6 @@ setInterval(function(){
             var banTime = bannedIPs[ip];
             if (now - banTime > config.poolServer.banning.time * 1000) {
                 delete bannedIPs[ip];
-                delete perIPStats[ip];
                 log('info', logSystem, 'Ban dropped for %s', [ip]);
             }
         }
@@ -121,8 +112,6 @@ function BlockTemplate(template){
     this.reserveOffset = template.reserved_offset;
     this.buffer = new Buffer(this.blob, 'hex');
     instanceId.copy(this.buffer, this.reserveOffset + 4, 0, 3);
-    this.previous_hash = new Buffer(32);
-    this.buffer.copy(this.previous_hash,0,7,39);
     this.extraNonce = 0;
 }
 BlockTemplate.prototype = {
@@ -138,100 +127,26 @@ function getBlockTemplate(callback){
     apiInterfaces.rpcDaemon('getblocktemplate', {reserve_size: 8, wallet_address: config.poolServer.poolAddress}, callback);
 }
 
-function getBlockCount(callback){
-    apiInterfaces.rpcDaemon('getblockcount', null, callback);
-}
 
-function getBlockHash(callback){
-    apiInterfaces.rpcDaemon('on_getblockhash', [currentBlockHeight - 1], callback);
-}
 
-function jobLoop()
-{
-    jobRefresh();
-    setTimeout(function(){ jobLoop(); }, config.poolServer.blockRefreshInterval);
-}
-
-var jobRefreshCompleteCallback = null;
-function jobRefreshError(text, error)
-{
-    log('error', logSystem, text, [error]);
-    if(jobRefreshCompleteCallback != null)
-        jobRefreshCompleteCallback(false);
-}
-
-var jobRefreshCounter = 0;
-function jobRefresh(state){
-    state = state || "check_force";
-
-    switch(state){
-    case "check_force":
-        if(jobRefreshCounter % config.poolServer.blockRefreshForce == 0)
-            jobRefresh("get_template");
-        else
-            jobRefresh("check_count");
-        jobRefreshCounter++;
-        break;
-
-    case "check_count":
-        getBlockCount(function(error, result){
-            if (error){
-                jobRefreshError('Error polling getblockcount %j', error);
-                return;
-            }
-
-            if(result.count == currentBlockHeight) {
-                jobRefresh("check_hash");
-                return;
-            }
-
-            log('info', logSystem, 'Blockchain height changed to %d, updating template.', [currentBlockHeight]);
-            jobRefresh("get_template");
+function jobRefresh(loop, callback){
+    callback = callback || function(){};
+    getBlockTemplate(function(error, result){
+        if (loop)
+            setTimeout(function(){
+                jobRefresh(true);
+            }, config.poolServer.blockRefreshInterval);
+        if (error){
+            log('error', logSystem, 'Error polling getblocktemplate %j', [error]);
+            callback(false);
             return;
-        });
-	break;
-
-    case "check_hash":
-	getBlockHash(function(error, result){
-	    if(error) {
-		jobRefreshError('Error polling on_getblockhash %j', error);
-                return;
-            }
-
-	    if(result == currentBlockHash) {
-                if(jobRefreshCompleteCallback != null)
-                     jobRefreshCompleteCallback(true);
-                return;
-            }
-
-            log('info', logSystem, 'Blockchain hash changed to %s, updating template.', currentBlockHash);
-            jobRefresh("get_template");
-            return;
-        });
-        break;
-
-    case "get_template":
-        getBlockTemplate(function(error, result){
-            if(error) {
-		jobRefreshError('Error polling getblocktemplate %j', error);
-                return;
-            }
-
-            currentBlockHeight = result.height;
-            currentBlockHash = result.prev_hash;
-
-            var buffer = new Buffer(result.blocktemplate_blob, 'hex');
-            var previous_hash = new Buffer(32);
-            buffer.copy(previous_hash,0,7,39);
-            if (!currentBlockTemplate || previous_hash.toString('hex') != currentBlockTemplate.previous_hash.toString('hex')){
-                log('info', logSystem, 'New block to mine at height %d w/ difficulty of %d', [result.height, result.difficulty]);
-                processBlockTemplate(result);
-            }
-
-            if(jobRefreshCompleteCallback != null)
-                jobRefreshCompleteCallback(true);
-        });
-    }
+        }
+        if (!currentBlockTemplate || result.height > currentBlockTemplate.height){
+            log('info', logSystem, 'New block to mine at height %d w/ difficulty of %d', [result.height, result.difficulty]);
+            processBlockTemplate(result);
+        }
+        callback(true);
+    })
 }
 
 
@@ -255,16 +170,15 @@ function processBlockTemplate(template){
 
 
 (function init(){
-    jobRefreshCompleteCallback = function(sucessful){
+    jobRefresh(true, function(sucessful){
         if (!sucessful){
             log('error', logSystem, 'Could not start pool');
             return;
         }
-        startPoolServerTcp(function(successful){ });
-        jobRefreshCompleteCallback = null;
-    };
+        startPoolServerTcp(function(successful){
 
-    jobLoop();
+        });
+    });
 })();
 
 var VarDiff = (function(){
@@ -278,7 +192,7 @@ var VarDiff = (function(){
     };
 })();
 
-function Miner(id, login, workerName, pass, ip, startingDiff, noRetarget, pushMessage){
+function Miner(id, login, pass, ip, startingDiff, noRetarget, pushMessage){
     this.id = id;
     this.login = login;
     this.pass = pass;
@@ -287,7 +201,6 @@ function Miner(id, login, workerName, pass, ip, startingDiff, noRetarget, pushMe
     this.heartbeat();
     this.noRetarget = noRetarget;
     this.difficulty = startingDiff;
-    this.workerName = workerName;
     this.validJobs = [];
 
     // Vardiff related variables
@@ -365,7 +278,8 @@ Miner.prototype = {
         diffBuff.copy(padded, 32 - diffBuff.length);
 
         var buff = padded.slice(0, 4);
-        var buffArray = buff.toByteArray().reverse();
+        var buffArray = buff.toJSON();
+        buffArray.reverse();
         var buffReversed = new Buffer(buffArray);
         this.target = buffReversed.readUInt32BE(0);
         var hex = buffReversed.toString('hex');
@@ -406,24 +320,17 @@ Miner.prototype = {
     },
     checkBan: function(validShare){
         if (!banningEnabled) return;
-        // Store valid/invalid shares per IP (already initialized with 0s)
-        // Init global per-IP shares stats
-        if (!perIPStats[this.ip]){
-            perIPStats[this.ip] = { validShares: 0, invalidShares: 0 };
-        }
-        var stats = perIPStats[this.ip];
-        validShare ? stats.validShares++ : stats.invalidShares++;
-
-        if (stats.validShares + stats.invalidShares >= config.poolServer.banning.checkThreshold){
-            if (stats.invalidShares / stats.validShares >= config.poolServer.banning.invalidPercent / 100){
+        validShare ? this.validShares++ : this.invalidShares++;
+        if (this.validShares + this.invalidShares >= config.poolServer.banning.checkThreshold){
+            if (this.invalidShares / this.validShares >= config.poolServer.banning.invalidPercent / 100){
                 log('warn', logSystem, 'Banned %s@%s', [this.login, this.ip]);
                 bannedIPs[this.ip] = Date.now();
                 delete connectedMiners[this.id];
                 process.send({type: 'banIP', ip: this.ip});
             }
             else{
-                stats.invalidShares = 0;
-                stats.validShares = 0;
+                this.invalidShares = 0;
+                this.validShares = 0;
             }
         }
     }
@@ -435,21 +342,12 @@ function recordShareData(miner, job, shareDiff, blockCandidate, hashHex, shareTy
 
     var dateNow = Date.now();
     var dateNowSeconds = dateNow / 1000 | 0;
-    // Expire the stats per unique worker after 7 days. Note that an
-    // address and IP can have multiple workers (e.g. one process for CPU and
-    // one for GPU).
-    var uniqueWorkerTtl = 86400 * 7;
-    var uniqueWorkerKey = [config.coin, 'unique_workers', miner.login, miner.id, miner.ip].join(':');
 
     var redisCommands = [
         ['hincrby', config.coin + ':shares:roundCurrent', miner.login, job.difficulty],
         ['zadd', config.coin + ':hashrate', dateNowSeconds, [job.difficulty, miner.login, dateNow].join(':')],
-        ['zadd', config.coin + ':hashrate', dateNowSeconds, [job.difficulty, miner.login + '+' + miner.workerName, dateNow].join(':')],
         ['hincrby', config.coin + ':workers:' + miner.login, 'hashes', job.difficulty],
-        ['hset', config.coin + ':workers:' + miner.login, 'lastShare', dateNowSeconds],
-        ['hset', uniqueWorkerKey, 'lastShare', dateNowSeconds],
-        ['hset', uniqueWorkerKey, 'address', miner.login],
-        ['expire', uniqueWorkerKey, uniqueWorkerTtl]
+        ['hset', config.coin + ':workers:' + miner.login, 'lastShare', dateNowSeconds]
     ];
 
     if (blockCandidate){
@@ -466,7 +364,7 @@ function recordShareData(miner, job, shareDiff, blockCandidate, hashHex, shareTy
         if (blockCandidate){
             var workerShares = replies[replies.length - 1];
             var totalShares = Object.keys(workerShares).reduce(function(p, c){
-                return p + parseInt(workerShares[c]);
+                return p + parseInt(workerShares[c])
             }, 0);
             redisClient.zadd(config.coin + ':blocks:candidates', job.height, [
                 hashHex,
@@ -512,7 +410,8 @@ function processShare(miner, job, blockTemplate, nonce, resultHash){
         return false;
     }
 
-    var hashArray = hash.toByteArray().reverse();
+    var hashArray = hash.toJSON();
+    hashArray.reverse();
     var hashNum = bignum.fromBuffer(new Buffer(hashArray));
     var hashDiff = diff1.div(hashNum);
 
@@ -532,7 +431,7 @@ function processShare(miner, job, blockTemplate, nonce, resultHash){
                     [blockFastHash.substr(0, 6), job.height, miner.login, miner.ip, result]
                 );
                 recordShareData(miner, job, hashDiff.toString(), true, blockFastHash, shareType, blockTemplate);
-                jobRefresh("get_template");
+                jobRefresh();
             }
         });
     }
@@ -553,11 +452,7 @@ function handleMinerMethod(method, params, ip, portData, sendReply, pushMessage)
 
 
     var miner = connectedMiners[params.id];
-    // Check for ban here, so preconnected attackers can't continue to screw you
-    if (IsBannedIp(ip)){
-        sendReply('your IP is banned');
-        return;
-    }
+
     switch(method){
         case 'login':
             var login = params.login;
@@ -567,15 +462,7 @@ function handleMinerMethod(method, params, ip, portData, sendReply, pushMessage)
             }
 
             var difficulty = portData.difficulty;
-            var workerName = "unknown";
             var noRetarget = false;
-            // Grep the worker name.
-            var workerNameCharPos = login.indexOf('+');
-            if (workerNameCharPos != -1) {
-              workerName = login.substr(workerNameCharPos + 1);
-              login = login.substr(0, workerNameCharPos);
-              log('info', logSystem, 'Miner %s uses worker name: %s',  [login, workerName]);
-            }
             if(config.poolServer.fixedDiff.enabled) {
                 var fixedDiffCharPos = login.indexOf(config.poolServer.fixedDiff.addressSeparator);
                 if(fixedDiffCharPos != -1) {
@@ -589,23 +476,23 @@ function handleMinerMethod(method, params, ip, portData, sendReply, pushMessage)
                 }
             }
 
-            // Check that the address prefix is sane.
-            var addressPrefix = cnUtil.address_decode(new Buffer(login)).toString();
-            if (config.poolServer.allowedMinerAddressPrefixes.indexOf(addressPrefix) == -1) {
-                sendReply('invalid address used');
+            if (addressBase58Prefix !== cnUtil.address_decode(new Buffer(login))){
+                sendReply('invalid address used for login');
                 return;
             }
-
+            if (IsBannedIp(ip)){
+                sendReply('your IP is banned');
+                return;
+            }
             var minerId = utils.uid();
-            miner = new Miner(minerId, login, workerName, params.pass, ip, difficulty, noRetarget, pushMessage);
+            miner = new Miner(minerId, login, params.pass, ip, difficulty, noRetarget, pushMessage);
             connectedMiners[minerId] = miner;
-            
             sendReply(null, {
                 id: minerId,
                 job: miner.getJob(),
                 status: 'OK'
             });
-            log('info', logSystem, 'Miner connected %s@%s',  [login, miner.ip]);
+            log('info', logSystem, 'Miner connected %s@%s',  [params.login, miner.ip]);
             break;
         case 'getjob':
             if (!miner){
@@ -632,20 +519,10 @@ function handleMinerMethod(method, params, ip, portData, sendReply, pushMessage)
             }
 
 	    params.nonce = params.nonce.substr(0, 8).toLowerCase();
-            if (!noncePattern.test(params.nonce)) {
-                 var minerText = miner ? (' ' + miner.login + '@' + miner.ip) : '';
-                log('warn', logSystem, 'Malformed nonce: ' + JSON.stringify(params) + ' from ' + minerText);
-                 perIPStats[miner.ip] = { validShares: 0, invalidShares: 999999 };
-                 miner.checkBan(false);
-                 sendReply('Duplicate share');
-                 return;
-            }
 
             if (job.submissions.indexOf(params.nonce) !== -1){
                 var minerText = miner ? (' ' + miner.login + '@' + miner.ip) : '';
                 log('warn', logSystem, 'Duplicate share: ' + JSON.stringify(params) + ' from ' + minerText);
-                perIPStats[miner.ip] = { validShares: 0, invalidShares: 999999 };
-                miner.checkBan(false);
                 sendReply('Duplicate share');
                 return;
             }
@@ -657,15 +534,13 @@ function handleMinerMethod(method, params, ip, portData, sendReply, pushMessage)
             })[0];
 
             if (!blockTemplate){
-                var minerText = miner ? (' ' + miner.login + '@' + miner.ip) : '';
-                log('warn', logSystem, 'Block expired, Height: ' + job.height + ' from ' + minerText);
                 sendReply('Block expired');
                 return;
             }
 
             var shareAccepted = processShare(miner, job, blockTemplate, params.nonce, params.result);
             miner.checkBan(shareAccepted);
-
+            
             if (shareTrustEnabled){
                 if (shareAccepted){
                     miner.trust.probability -= shareTrustStepFloat;
@@ -680,7 +555,7 @@ function handleMinerMethod(method, params, ip, portData, sendReply, pushMessage)
                     miner.trust.penalty = config.poolServer.shareTrust.penalty;
                 }
             }
-
+			
 			if (!shareAccepted){
                 sendReply('Low difficulty share');
                 return;
@@ -692,11 +567,6 @@ function handleMinerMethod(method, params, ip, portData, sendReply, pushMessage)
             //miner.retarget(now);
 
             sendReply(null, {status: 'OK'});
-            break;
-        case 'keepalived' :
-            miner.heartbeat()
-            sendReply(null, { status:'KEEPALIVED'
-            });
             break;
         default:
             sendReply("invalid method");
@@ -721,10 +591,6 @@ function startPoolServerTcp(callback){
                 log('warn', logSystem, 'Miner RPC request missing RPC method');
                 return;
             }
-            else if (!jsonData.params) {
-                log('warn', logSystem, 'Miner RPC request missing RPC params');
-                return;
-            }
 
             var sendReply = function(error, result){
                 if(!socket.writable) return;
@@ -740,7 +606,7 @@ function startPoolServerTcp(callback){
             handleMinerMethod(jsonData.method, jsonData.params, socket.remoteAddress, portData, sendReply, pushMessage);
         };
 
-        var socketResponder = function(socket){
+        net.createServer(function(socket){
             socket.setKeepAlive(true);
             socket.setEncoding('utf8');
 
@@ -802,36 +668,15 @@ function startPoolServerTcp(callback){
                 pushMessage = function(){};
             });
 
-        };
-
-        if(portData.type === 'SSL') {
-          var options = {
-            key: fs.readFileSync(config.poolServer.sslKey),
-            cert: fs.readFileSync(config.poolServer.sslCert)
-          };
-          tls.createServer(options, socketResponder).listen(portData.port, function (error, result) {
+        }).listen(portData.port, function (error, result) {
             if (error) {
-              log('error', logSystem, 'SSL Could not start server listening on port %d, error: $j', [portData.port, error]);
-              cback(true);
-              return;
+                log('error', logSystem, 'Could not start server listening on port %d, error: $j', [portData.port, error]);
+                cback(true);
+                return;
             }
-            log('info', logSystem, 'SSL Started server listening on port %d', [portData.port]);
+            log('info', logSystem, 'Started server listening on port %d', [portData.port]);
             cback();
-          });
-        }
-        else {
-          net.createServer(socketResponder).listen(portData.port, function (error, result) {
-            if (error) {
-              log('error', logSystem, 'Could not start server listening on port %d, error: $j', [portData.port, error]);
-              cback(true);
-              return;
-            }
-          log('info', logSystem, 'Started server listening on port %d', [portData.port]);
-          cback();
         });
-      }
-
-
 
     }, function(err){
         if (err)

@@ -7,7 +7,6 @@ var apiInterfaces = require('./apiInterfaces.js')(config.daemon, config.wallet, 
 
 var logSystem = 'payments';
 require('./exceptionWriter.js')(logSystem);
-var emailSystem = require('./email.js');
 
 
 log('info', logSystem, 'Started');
@@ -16,7 +15,7 @@ log('info', logSystem, 'Started');
 function runInterval(){
     async.waterfall([
 
-        //Get workers from workers set.
+        //Get worker keys
         function(callback){
             redisClient.keys(config.coin + ':workers:*', function(error, result) {
                 if (error) {
@@ -31,7 +30,7 @@ function runInterval(){
         //Get worker balances
         function(keys, callback){
             var redisCommands = keys.map(function(k){
-                return ['hmget', k, 'balance', 'minPayoutLevel'];
+                return ['hget', k, 'balance'];
             });
             redisClient.multi(redisCommands).exec(function(error, replies){
                 if (error){
@@ -40,33 +39,26 @@ function runInterval(){
                     return;
                 }
                 var balances = {};
-                var minPayoutLevel = {};
                 for (var i = 0; i < replies.length; i++){
                     var parts = keys[i].split(':');
                     var workerId = parts[parts.length - 1];
-                    data = replies[i];
-                    balances[workerId] = parseInt(data[0]) || 0
-                    minPayoutLevel[workerId] = parseInt(data[1]) || config.payments.minPayment
-                    log('info', logSystem, 'Using payout level %d for worker %s (default: %d)', [minPayoutLevel[workerId], workerId, config.payments.minPayment]);
+                    balances[workerId] = parseInt(replies[i]) || 0
+
                 }
-                callback(null, balances, minPayoutLevel);
+                callback(null, balances);
             });
         },
 
         //Filter workers under balance threshold for payment
-        function(balances, minPayoutLevel, callback){
+        function(balances, callback){
 
             var payments = {};
 
             for (var worker in balances){
                 var balance = balances[worker];
-                if (balance >= minPayoutLevel[worker]){
+                if (balance >= config.payments.minPayment){
                     var remainder = balance % config.payments.denomination;
                     var payout = balance - remainder;
-                    // if use dynamic transfer fee, fee will be subtracted from miner's payout
-                    if(config.payments.useDynamicTransferFee && config.payments.minerPayFee){
-                      payout -= config.payments.transferFeePerPayee;
-                    }
                     if (payout < 0) continue;
                     payments[worker] = payout;
                 }
@@ -82,13 +74,13 @@ function runInterval(){
             var addresses = 0;
             var commandAmount = 0;
             var commandIndex = 0;
-
-			for (var worker in payments){
+			
+            for (var worker in payments){
                 var amount = parseInt(payments[worker]);
 				if(config.payments.maxTransactionAmount && amount + commandAmount > config.payments.maxTransactionAmount) {
 		            amount = config.payments.maxTransactionAmount - commandAmount;
 	            }
-
+				
 				if(!transferCommands[commandIndex]) {
 					transferCommands[commandIndex] = {
 						redis: [],
@@ -101,26 +93,16 @@ function runInterval(){
 						}
 					};
 				}
+				
+                transferCommands[commandIndex].rpc.destinations.push({amount: amount, address: worker});
+                transferCommands[commandIndex].redis.push(['hincrby', config.coin + ':workers:' + worker, 'balance', -amount]);
+                transferCommands[commandIndex].redis.push(['hincrby', config.coin + ':workers:' + worker, 'paid', amount]);
+                transferCommands[commandIndex].amount += amount;
 
-        transferCommands[commandIndex].rpc.destinations.push({amount: amount, address: worker});
-        transferCommands[commandIndex].redis.push(['hincrby', config.coin + ':workers:' + worker, 'balance', -amount]);
-				if(config.payments.useDynamicTransferFee && config.payments.minerPayFee){
-					transferCommands[commandIndex].redis.push(['hincrby', config.coin + ':workers:' + worker, 'balance', -config.payments.transferFeePerPayee]);
-				}
-				transferCommands[commandIndex].redis.push(['hincrby', config.coin + ':workers:' + worker, 'payments', 1]);
-				transferCommands[commandIndex].redis.push(['hincrby', config.coin + ':workers:' + worker, 'paid', amount]);
-        transferCommands[commandIndex].amount += amount;
-
-        addresses++;
+                addresses++;
 				commandAmount += amount;
-
-				// update payment fee if use dynamic transfer fee
-				if(config.payments.useDynamicTransferFee){
-					transferCommands[commandIndex].rpc.fee = config.payments.transferFeePerPayee * addresses;
-				}
-
                 if (addresses >= config.payments.maxAddresses || ( config.payments.maxTransactionAmount && commandAmount >= config.payments.maxTransactionAmount)) {
-					commandIndex++;
+                    commandIndex++;
                     addresses = 0;
 					commandAmount = 0;
                 }
@@ -171,14 +153,6 @@ function runInterval(){
                         }
                         cback(true);
                     });
-
-                    // Send out emails. This is the last step because
-                    // if something would fail here it will not interfere
-                    // with the payment handling.
-                    for (var i = 0; i < transferCmd.rpc.destinations.length; i++){
-                      var address = transferCmd.rpc.destinations[i].address;
-                      emailSystem.notifyAddress(address, 'You received a payment!', 'payment_received');
-                    }
                 });
             }, function(succeeded){
                 var failedAmount = transferCommands.length - succeeded.length;

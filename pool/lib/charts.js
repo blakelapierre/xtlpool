@@ -184,13 +184,8 @@ function collectUsersHashrate(chartName, settings) {
 }
 
 function getCoinPrice(callback) {
-    apiInterfaces.jsonHttpRequest('api.cryptonator.com', 443, '', function(error, response) {
-      if (error) {
-        log('warn', logSystem, 'Cryptonator API call failed: %j', [error]);
-        callback(error, response.success ? +response.ticker.price : null);
-      } else {
-        callback(response.error, response.success ? +response.ticker.price : null);
-      }
+    apiInterfaces.jsonHttpRequest('www.cryptonator.com', 443, '', function(error, response) {
+        callback(response.error ? response.error : error, response.success ? +response.ticker.price : null);
     }, '/api/ticker/' + config.symbol.toLowerCase() + '-usd');
 }
 
