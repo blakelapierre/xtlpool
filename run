@@ -1,6 +1,6 @@
 #!/bin/sh
 
-docker run -d --rm --name redis -v ~//redis-data:/data redis:alpine
+docker run -d --rm --name redis -v ~/redis-data:/data redis:alpine
 docker run -d --rm --name daemon -v ~/daemon-data:/daemon-data blakelapierre/xtlpool-daemon
 docker run -d --rm --name wallet --link daemon -v ~/wallet-data:/wallet-data blakelapierre/xtlpool-wallet
 docker run -d --rm --name www -p 80:80 blakelapierre/xtlpool-www
