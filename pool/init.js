@@ -10,7 +10,24 @@ require('./lib/configReader.js');
 require('./lib/logger.js');
 
 
-global.redisClient = redis.createClient(config.redis.port, config.redis.host);
+var logSystem = 'master';
+global.redisClient = redis.createClient(config.redis.port, config.redis.host, {
+    retry_strategy: function (options) {
+        if (options.total_retry_time > 1000 * 60 * 30) {
+            // End reconnecting after a specific timeout and flush all commands
+            // with a individual error
+            return new Error('Retry time exhausted');
+        }
+        if (options.attempt > 10) {
+            // End reconnecting with built in error
+						log('error', logSystem, 'Reddis client exceeded max retries');
+            return undefined;
+        }
+				log('error', logSystem, 'Reddis client needs to retry (attempt: %d)', [options.attempt]);
+        // Reconnect after this many seconds.
+        return options.attempt * 1000;
+    }
+});
 
 
 if (cluster.isWorker){
@@ -38,22 +55,27 @@ if (cluster.isWorker){
     return;
 }
 
-var logSystem = 'master';
 require('./lib/exceptionWriter.js')(logSystem);
 
 
-var singleModule = (function(){
+var selectedModules = (function(){
 
     var validModules = ['pool', 'api', 'unlocker', 'payments', 'chartsDataCollector'];
 
     for (var i = 0; i < process.argv.length; i++){
         if (process.argv[i].indexOf('-module=') === 0){
-            var moduleName = process.argv[i].split('=')[1];
-            if (validModules.indexOf(moduleName) > -1)
-                return moduleName;
-
-            log('error', logSystem, 'Invalid module "%s", valid modules: %s', [moduleName, validModules.join(', ')]);
-            process.exit();
+            var modulesStr = process.argv[i].split('=')[1];
+            var moduleNames = modulesStr.split(',');
+            for(var j = 0; j < moduleNames.length;j++)
+            {
+                var module = moduleNames[j];
+                if (!(validModules.indexOf(module) > -1))
+                {
+                    log('error', logSystem, 'Invalid module "%s", valid modules: %s', [module, validModules.join(', ')]);
+                    process.exit();
+                }
+                return moduleNames;
+            }
         }
     }
 })();
@@ -63,25 +85,30 @@ var singleModule = (function(){
 
     checkRedisVersion(function(){
 
-        if (singleModule){
-            log('info', logSystem, 'Running in single module mode: %s', [singleModule]);
-
-            switch(singleModule){
-                case 'pool':
-                    spawnPoolWorkers();
-                    break;
-                case 'unlocker':
-                    spawnBlockUnlocker();
-                    break;
-                case 'payments':
-                    spawnPaymentProcessor();
-                    break;
-                case 'api':
-                    spawnApi();
-                    break;
-                case 'chartsDataCollector':
-                    spawnChartsDataCollector();
-                    break;
+        if (selectedModules){
+            log('info', logSystem, 'Running in selected module mode: %s', [selectedModules]);
+            for (var i = 0; i < selectedModules.length; i++){
+                var selectedModule = selectedModules[i];
+                switch(selectedModule){
+                    case 'pool':
+                        spawnPoolWorkers();
+                        break;
+                    case 'unlocker':
+                        spawnBlockUnlocker();
+                        break;
+                    case 'payments':
+                        spawnPaymentProcessor();
+                        break;
+                    case 'api':
+                        spawnApi();
+                        break;
+                    case 'chartsDataCollector':
+                        spawnChartsDataCollector();
+                        break;
+                    case 'purchases':
+                        spawnPurchaseProcessor();
+                        break;
+                }
             }
         }
         else{

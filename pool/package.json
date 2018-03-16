@@ -1,11 +1,11 @@
 {
-    "name": "forknote-pool",
+    "name": "cryptonote-universal-pool",
     "version": "0.0.1",
     "license": "GPL-2.0",
-    "authors": "Matthew Little",
+    "author": "Matthew Little",
     "repository": {
         "type": "git",
-        "url": "https://github.com/forknote/forknote-pool"
+        "url": "https://github.com/fancoder/cryptonote-universal-pool.git"
     },
     "dependencies": {
         "bignum": "*",
@@ -14,10 +14,11 @@
         "cli-color": "*",
         "dateformat": "*",
         "base58-native": "*",
-        "multi-hashing": "git://github.com/fancoder/node-multi-hashing.git",
-        "cryptonote-util": "git://github.com/forknote/node-cryptonote-util.git"
+        "mailgun.js": "*",
+        "multi-hashing": "git://github.com/clintar/node-multi-hashing.git#Nan-2.0",
+        "cryptonote-util": "git://github.com/M5M400/node-cryptonote-util.git#xmr-Nan-2.0"
     },
     "engines": {
-        "node": ">=0.10"
+        "node": ">=4.0"
     }
 }

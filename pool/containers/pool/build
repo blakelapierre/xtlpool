@@ -2,4 +2,4 @@
 
 cp ../../config.json config.json
 
-docker build . -t blakelapierre/xtlpool-pool
+docker build . -t blakelapierre/xtlpool-pool --no-cache

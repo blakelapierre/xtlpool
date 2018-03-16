@@ -4,11 +4,11 @@ RUN apt-get update && apt-get install -y git build-essential redis-server libboo
 
 RUN git clone https://github.com/blakelapierre/xtlpool
 
-RUN cd xtlpool/xtlpool && npm update
+RUN cd xtlpool/pool && npm update
 
 EXPOSE 8117
 EXPOSE 9999
 
-ADD config.json /xtlpool/xtlpool/config.json
+ADD config.json /xtlpool/pool/config.json
 
-CMD cd xtlpool/xtlpool && node init.js
+CMD cd xtlpool/pool && node init.js

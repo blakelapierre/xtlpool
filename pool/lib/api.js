@@ -1,7 +1,9 @@
 var fs = require('fs');
 var http = require('http');
+var https = require('https');
 var url = require("url");
 var zlib = require('zlib');
+var os = require('os');
 
 var async = require('async');
 
@@ -10,6 +12,7 @@ var charts = require('./charts.js');
 var authSid = Math.round(Math.random() * 10000000000) + '' + Math.round(Math.random() * 10000000000);
 
 var logSystem = 'api';
+var emailSystem = require('./email.js');
 require('./exceptionWriter.js')(logSystem);
 
 var redisCommands = [
@@ -51,7 +54,6 @@ function collectStats(){
             redisClient.multi(redisCommands).exec(function(error, replies){
 
                 redisFinished = Date.now();
-                var dateNowSeconds = Date.now() / 1000 | 0;
 
                 if (error){
                     log('error', logSystem, 'Error getting redis data %j', [error]);
@@ -82,7 +84,11 @@ function collectStats(){
 
                 for (var miner in minersHashrate){
                     var shares = minersHashrate[miner];
-                    totalShares += shares;
+                    // Do not count the hashrates of individual workers. Instead
+                    // only use the shares where miner == wallet address.
+                    if (miner.indexOf('+') != -1) {
+                      totalShares += shares;
+                    }
                     minersHashrate[miner] = Math.round(shares / config.api.hashrateWindow);
                     minerStats[miner] = getReadableHashRateString(minersHashrate[miner]);
                 }
@@ -95,12 +101,7 @@ function collectStats(){
 
                 if (replies[5]){
                     for (var miner in replies[5]){
-                        if (config.poolServer.slushMining.enabled) {
-                            data.roundHashes +=  parseInt(replies[5][miner]) / Math.pow(Math.E, ((data.lastBlockFound - dateNowSeconds) / config.poolServer.slushMining.weight)); //TODO: Abstract: If something different than lastBlockfound is used for scoreTime, this needs change. 
-                        }
-                        else {
-                            data.roundHashes +=  parseInt(replies[5][miner]);
-                        }
+                        data.roundHashes += parseInt(replies[5][miner]);
                     }
                 }
 
@@ -142,13 +143,18 @@ function collectStats(){
                 donation: donations,
                 version: version,
                 minPaymentThreshold: config.payments.minPayment,
-                denominationUnit: config.payments.denomination,
-                blockTime: config.coinDifficultyTarget,
-                slushMiningEnabled: config.poolServer.slushMining.enabled,
-                weight: config.poolServer.slushMining.weight
+                denominationUnit: config.payments.denomination
             });
         },
-        charts: charts.getPoolChartsData
+        charts: charts.getPoolChartsData,
+        system: function(callback){
+          var os_load = os.loadavg();
+          var num_cores = os.cpus().length;
+          callback(null, {
+            load: os_load,
+            number_cores: num_cores
+          });
+        }
     }, function(error, results){
 
         log('info', logSystem, 'Stat collection finished: %d ms redis, %d ms daemon', [redisFinished - startTime, daemonFinished - startTime]);
@@ -222,6 +228,65 @@ function broadcastLiveStats(){
 function handleMinerStats(urlParts, response){
     response.writeHead(200, {
         'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'max-age=3',
+        'Content-Type': 'application/json',
+        'Connection': 'keep-alive'
+    });
+    response.write('\n');
+    var address = urlParts.query.address;
+
+    redisClient.multi([
+        ['hgetall', config.coin + ':workers:' + address],
+        ['zrevrange', config.coin + ':payments:' + address, 0, config.api.payments - 1, 'WITHSCORES'],
+        ['hgetall', config.coin + ':shares:roundCurrent'],
+        ['keys', config.coin + ':charts:hashrate:' + address + '*']
+    ]).exec(function(error, replies){
+        if (error || !replies[0]){
+            response.end(JSON.stringify({error: 'not found'}));
+            return;
+        }
+        var stats = replies[0];
+        stats.hashrate = minerStats[address];
+
+        if (config.payments.blockReward != 0) {
+          // Provide a rough estimation what the address owner would earn if
+          // the a block would be found and payed out right now.
+          var totalShares = 0;
+          var myShares = 0;
+          for (var key in replies[2]) {
+            totalShares += parseInt(replies[2][key]);
+            if (key == address) {
+              myShares = parseInt(replies[2][key]);
+            }
+          }
+          var payout_estimate = (myShares / totalShares) * config.payments.blockReward;
+          stats.payout_estimate = payout_estimate.toFixed(9);
+        }
+
+        // Grab the worker names.
+        var workers = [];
+        for (var i=0; i<replies[3].length; i++) {
+          var key = replies[3][i];
+          var nameOffset = key.indexOf('+');
+          if (nameOffset != -1) {
+            workers.push(key.substr(nameOffset + 1));
+          }
+        }
+
+        charts.getUserChartsData(address, replies[1], function(error, chartsData) {
+            response.end(JSON.stringify({
+                stats: stats,
+                payments: replies[1],
+                charts: chartsData,
+                workers: workers
+            }));
+        });
+    });
+}
+
+function handleWorkerStats(urlParts, response){
+    response.writeHead(200, {
+        'Access-Control-Allow-Origin': '*',
         'Cache-Control': 'no-cache',
         'Content-Type': 'application/json',
         'Connection': 'keep-alive'
@@ -229,38 +294,193 @@ function handleMinerStats(urlParts, response){
     response.write('\n');
     var address = urlParts.query.address;
 
-    if (urlParts.query.longpoll === 'true'){
-        redisClient.exists(config.coin + ':workers:' + address, function(error, result){
-            if (!result){
-                response.end(JSON.stringify({error: 'not found'}));
+    charts.getUserChartsData(address, [], function(error, chartsData) {
+      response.end(JSON.stringify({ charts: chartsData }));
+    });
+}
+
+/* Call 'callback' when we've seen a miner for 'address' using 'ip' */
+function minerSeenWithIPForAddress(address, ip, callback) {
+    var ipv4_regex = /\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/;
+    if (ipv4_regex.test(ip)) {
+        ip = '::ffff:' + ip;
+    }
+    redisClient.keys(config.coin + ':unique_workers:' + address + ':*:' + ip, function(error, keys) {
+          callback(error, keys);
+    });
+}
+
+function handleSetMinerPayoutLevel(urlParts, response){
+    response.writeHead(200, {
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'no-cache',
+        'Content-Type': 'application/json',
+        'Connection': 'keep-alive'
+    });
+    response.write('\n');
+
+    var address = urlParts.query.address;
+    var ip = urlParts.query.ip;
+    var level = urlParts.query.level;
+
+    // Check the minimal required parameters for this handle.
+    if (ip == undefined || address == undefined || level == undefined) {
+        response.end(JSON.stringify({'status': 'parameters are incomplete'}));
+        return;
+    }
+
+    // Do not allow wildcards in the queries.
+    if (ip.indexOf('*') != -1 || address.indexOf('*') != -1) {
+        response.end(JSON.stringify({'status': 'remove the wildcard from your input'}));
+        return;
+    }
+
+    level = parseFloat(level);
+    if (isNaN(level)) {
+        response.end(JSON.stringify({'status': 'Your level doesn\'t look like a digit'}));
+        return;
+    }
+
+    if (level < 0.1 || level > 100) {
+        response.end(JSON.stringify({'status': 'Please choose a level between 0.1 and 100'}));
+        return;
+    }
+
+    // Only do a modification if we have seen the IP address in
+    // combination with the wallet address.
+    minerSeenWithIPForAddress(address, ip, function (error, keys) {
+        if (keys.length == 0 || error) {
+          response.end(JSON.stringify({'status': 'we haven\'t seen that IP for your sumo address'}));
+          return;
+        }
+
+        var sumo_level = level * 1000000000;
+        redisClient.hset(config.coin + ':workers:' + address, 'minPayoutLevel', sumo_level, function(error, value){
+            if (error){
+                response.end(JSON.stringify({'status': 'woops something failed'}));
                 return;
             }
-            addressConnections[address] = response;
-            response.on('finish', function(){
-                delete addressConnections[address];
-            })
+
+            log('info', logSystem, 'Updated payout level for address ' + address + ' level: ' + sumo_level);
+            emailSystem.notifyAddress(address, 'Your payout level changed to: ' + level, 'payout_level_changed');
+            response.end(JSON.stringify({'status': 'done'}));
         });
+    });
+}
+
+function handleGetMinerPayoutLevel(urlParts, response){
+    response.writeHead(200, {
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'no-cache',
+        'Content-Type': 'application/json',
+        'Connection': 'keep-alive'
+    });
+    response.write('\n');
+
+    var address = urlParts.query.address;
+    // Check the minimal required parameters for this handle.
+    if (address == undefined) {
+        response.end(JSON.stringify({'status': 'parameters are incomplete'}));
+        return;
     }
-    else{
-        redisClient.multi([
-            ['hgetall', config.coin + ':workers:' + address],
-            ['zrevrange', config.coin + ':payments:' + address, 0, config.api.payments - 1, 'WITHSCORES']
-        ]).exec(function(error, replies){
-            if (error || !replies[0]){
-                response.end(JSON.stringify({error: 'not found'}));
-                return;
-            }
-            var stats = replies[0];
-            stats.hashrate = minerStats[address];
-            charts.getUserChartsData(address, replies[1], function(error, chartsData) {
-                response.end(JSON.stringify({
-                    stats: stats,
-                    payments: replies[1],
-                    charts: chartsData
-                }));
-            });
-        });
+
+    redisClient.hget(config.coin + ':workers:' + address, 'minPayoutLevel', function(error, value){
+        if (error){
+            response.end(JSON.stringify({'status': 'woops something failed'}));
+            return;
+        }
+        var sumo = value / 1000000000
+        response.end(JSON.stringify({'status': 'done', 'level': sumo}));
+        return;
+    });
+}
+
+function handleSetAddressEmail(urlParts, response){
+    response.writeHead(200, {
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'no-cache',
+        'Content-Type': 'application/json',
+        'Connection': 'keep-alive'
+    });
+    response.write('\n');
+
+    var email = urlParts.query.email;
+    var address = urlParts.query.address;
+    var ip = urlParts.query.ip;
+    var action = urlParts.query.action;
+
+    // Check the minimal required parameters for this handle.
+    if (address == undefined || action == undefined) {
+        response.end(JSON.stringify({'status': 'parameters are incomplete'}));
+        return;
     }
+
+    // Do not allow wildcards in the queries.
+    if (ip.indexOf('*') != -1 || address.indexOf('*') != -1) {
+        response.end(JSON.stringify({'status': 'remove the wildcard from your input'}));
+        return;
+    }
+
+    // Now only do a modification if we have seen the IP address in combination
+    // with the wallet address.
+    minerSeenWithIPForAddress(address, ip, function (error, keys) {
+      if (keys.length == 0 || error) {
+        response.end(JSON.stringify({'status': 'we haven\'t seen that IP for your sumo address'}));
+        return;
+      }
+
+      if (action == "upsert") {
+          if (email == undefined) {
+              response.end(JSON.stringify({'status': 'email is missing'}));
+              return;
+          }
+          redisClient.hset(config.coin + ':notifications:', address, email, function(error, value){
+              if (error){
+                  response.end(JSON.stringify({'status': 'woops something failed'}));
+                  return;
+              }
+
+              emailSystem.notifyAddress(address, 'Your email was registered', 'email_added');
+          });
+          log('info', logSystem, 'Added email ' + email + ' for address: ' + address);
+      } else if (action == "delete") {
+          redisClient.hdel(config.coin + ':notifications:', address, function(error, value){
+              if (error){
+                  response.end(JSON.stringify({'status': 'woops something failed'}));
+                  return;
+              }
+          });
+          log('info', logSystem, 'Removed email for address: ' + address);
+      }
+      response.end(JSON.stringify({'status': 'done'}));
+  });
+}
+
+function handleGetAddressEmail(urlParts, response){
+    response.writeHead(200, {
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'no-cache',
+        'Content-Type': 'application/json',
+        'Connection': 'keep-alive'
+    });
+    response.write('\n');
+
+    var address = urlParts.query.address;
+
+    // Check the minimal required parameters for this handle.
+    if (address == undefined) {
+        response.end(JSON.stringify({'status': 'parameters are incomplete'}));
+        return;
+    }
+
+    redisClient.hget(config.coin + ':notifications:', address, function(error, value){
+        if (error){
+            response.end(JSON.stringify({'email': 'woops something failed'}));
+            return;
+        }
+        response.end(JSON.stringify({'email': value}));
+        return;
+    });
 }
 
 
@@ -352,7 +572,13 @@ function parseCookies(request) {
 }
 
 function authorize(request, response){
-    if(request.connection.remoteAddress == '127.0.0.1') {
+
+    var remoteAddress = request.connection.remoteAddress;
+    if (config.api.trust_proxy_ip && request.headers['x-forwarded-for']) {
+      remoteAddress = request.headers['x-forwarded-for'];
+    }
+
+    if(remoteAddress == '127.0.0.1' || remoteAddress == '::ffff:127.0.0.1' || remoteAddress == '::1') {
         return true;
     }
 
@@ -406,7 +632,7 @@ function handleAdminStats(response){
         //Get worker balances
         function(workerKeys, blocks, callback){
             var redisCommands = workerKeys.map(function(k){
-                return ['hmget', k, 'balance', 'paid'];
+                return ['hmget', k, 'balance', 'paid', 'payments'];
             });
             redisClient.multi(redisCommands).exec(function(error, replies){
                 if (error){
@@ -422,6 +648,7 @@ function handleAdminStats(response){
             var stats = {
                 totalOwed: 0,
                 totalPaid: 0,
+                totalPayments: 0,
                 totalRevenue: 0,
                 totalDiff: 0,
                 totalShares: 0,
@@ -433,6 +660,7 @@ function handleAdminStats(response){
             for (var i = 0; i < workerData.length; i++){
                 stats.totalOwed += parseInt(workerData[i][0]) || 0;
                 stats.totalPaid += parseInt(workerData[i][1]) || 0;
+                stats.totalPayments += parseInt(workerData[i][2]) || 0;
                 stats.totalWorkers++;
             }
 
@@ -471,7 +699,7 @@ function handleAdminUsers(response){
         // get workers data
         function(workerKeys, callback) {
             var redisCommands = workerKeys.map(function(k) {
-                return ['hmget', k, 'balance', 'paid', 'lastShare', 'hashes'];
+                return ['hmget', k, 'balance', 'paid', 'payments', 'lastShare', 'hashes'];
             });
             redisClient.multi(redisCommands).exec(function(error, redisData) {
                 var workersData = {};
@@ -482,8 +710,9 @@ function handleAdminUsers(response){
                     workersData[address] = {
                         pending: data[0],
                         paid: data[1],
-                        lastShare: data[2],
-                        hashes: data[3],
+                        payments: data[2],
+                        lastShare: data[3],
+                        hashes: data[4],
                         hashrate: minersHashrate[address] ? minersHashrate[address] : 0
                     };
                 }
@@ -499,6 +728,21 @@ function handleAdminUsers(response){
         }
     );
 }
+
+function handleHealthRequest(response) {
+    response.writeHead("200", {
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'no-cache',
+        'Content-Type': 'application/json'
+    });
+    async.parallel({
+        monitoring: getMonitoringData,
+        logs: getLogFiles
+    }, function(error, result) {
+        response.end(JSON.stringify(result));
+    });
+}
+
 
 
 function handleAdminMonitoring(response) {
@@ -526,9 +770,29 @@ function handleAdminLog(urlParts, response){
         'Cache-Control': 'no-cache',
         'Content-Length': fs.statSync(filePath).size
     });
-    fs.createReadStream(filePath).pipe(response)
+    fs.createReadStream(filePath).pipe(response);
 }
 
+function handleHealthRequest(response) {
+  response.writeHead("200", {
+    'Access-Control-Allow-Origin': '*',
+    'Cache-Control': 'no-cache',
+    'Content-Type': 'application/json'
+  });
+  async.parallel({
+    monitoring: getMonitoringData
+  }, function(error, result) {
+    var status = 'NOT OK';
+    if (result['monitoring']['daemon'] &&
+      result['monitoring']['daemon']['lastStatus'] == "ok" &&
+      result['monitoring']['wallet'] &&
+      result['monitoring']['wallet']['lastStatus'] == "ok") {
+      status = 'OK';
+    }
+
+    response.end(JSON.stringify({"status": status}));
+  });
+}
 
 function startRpcMonitoring(rpc, module, method, interval) {
     setInterval(function() {
@@ -575,7 +839,7 @@ function getMonitoringData(callback) {
     var modules = Object.keys(config.monitoring);
     var redisCommands = [];
     for(var i in modules) {
-        redisCommands.push(['hgetall', getMonitoringDataKey(modules[i])])
+        redisCommands.push(['hgetall', getMonitoringDataKey(modules[i])]);
     }
     redisClient.multi(redisCommands).exec(function(error, results) {
         var stats = {};
@@ -603,6 +867,135 @@ function getLogFiles(callback) {
         callback(error, logs);
     });
 }
+if(config.api.ssl == true)
+{
+  var options = {
+      key: fs.readFileSync(config.api.sslkey),
+      cert: fs.readFileSync(config.api.sslcert),
+      ca: fs.readFileSync(config.api.sslca),
+      honorCipherOrder: true
+  };
+
+  var server2 = https.createServer(options, function(request, response){
+
+
+      if (request.method.toUpperCase() === "OPTIONS"){
+
+          response.writeHead("204", "No Content", {
+              "access-control-allow-origin": '*',
+              "access-control-allow-methods": "GET, POST, PUT, DELETE, OPTIONS",
+              "access-control-allow-headers": "content-type, accept",
+              "access-control-max-age": 10, // Seconds.
+              "content-length": 0,
+              "Strict-Transport-Security": "max-age=604800"
+          });
+
+          return(response.end());
+      }
+
+
+      var urlParts = url.parse(request.url, true);
+
+      switch(urlParts.pathname){
+          case '/health':
+              handleHealthRequest(response);
+              break;
+          case '/stats':
+              var deflate = request.headers['accept-encoding'] && request.headers['accept-encoding'].indexOf('deflate') != -1;
+              var reply = deflate ? currentStatsCompressed : currentStats;
+              response.writeHead("200", {
+                  'Access-Control-Allow-Origin': '*',
+                  'Cache-Control': 'no-cache',
+                  'Content-Type': 'application/json',
+                  'Content-Encoding': deflate ? 'deflate' : '',
+                  'Content-Length': reply.length
+              });
+              response.end(reply);
+              break;
+          case '/live_stats':
+              response.writeHead(200, {
+                  'Access-Control-Allow-Origin': '*',
+                  'Cache-Control': 'no-cache',
+                  'Content-Type': 'application/json',
+                  'Content-Encoding': 'deflate',
+                  'Connection': 'keep-alive'
+              });
+              var uid = Math.random().toString();
+              liveConnections[uid] = response;
+              response.on("finish", function() {
+                  delete liveConnections[uid];
+              });
+              break;
+          case '/stats_address':
+              handleMinerStats(urlParts, response);
+              break;
+          case '/stats_worker':
+              handleWorkerStats(urlParts, response);
+              break;
+          case '/get_payments':
+              handleGetPayments(urlParts, response);
+              break;
+          case '/get_blocks':
+              handleGetBlocks(urlParts, response);
+              break;
+          case '/get_payment':
+              handleGetPayment(urlParts, response);
+              break;
+          case '/admin_stats':
+              if (!authorize(request, response))
+                  return;
+              handleAdminStats(response);
+              break;
+          case '/admin_monitoring':
+              if(!authorize(request, response)) {
+                  return;
+              }
+              handleAdminMonitoring(response);
+              break;
+          case '/admin_log':
+              if(!authorize(request, response)) {
+                  return;
+              }
+              handleAdminLog(urlParts, response);
+              break;
+          case '/admin_users':
+              if(!authorize(request, response)) {
+                  return;
+              }
+              handleAdminUsers(response);
+              break;
+
+          case '/miners_hashrate':
+              if (!authorize(request, response))
+                  return;
+              handleGetMinersHashrate(response);
+              break;
+          case '/miners_donationHashrate':
+              if (!authorize(request, response))
+                  return;
+              handleGetDonationsHashrate(response);
+              break;
+          case '/set_notification':
+              handleSetAddressEmail(urlParts, response);
+              break;
+          case '/get_notification':
+              handleGetAddressEmail(urlParts, response);
+              break;
+          case '/get_miner_payout_level':
+              handleGetMinerPayoutLevel(urlParts, response);
+              break;
+          case '/set_miner_payout_level':
+              handleSetMinerPayoutLevel(urlParts, response);
+              break;
+          default:
+              response.writeHead(404, {
+                  'Access-Control-Allow-Origin': '*'
+              });
+              response.end('Invalid API call');
+              break;
+      }
+  });
+}
 
 var server = http.createServer(function(request, response){
 
@@ -623,6 +1016,9 @@ var server = http.createServer(function(request, response){
     var urlParts = url.parse(request.url, true);
 
     switch(urlParts.pathname){
+        case '/health':
+            handleHealthRequest(response);
+            break;
         case '/stats':
             var deflate = request.headers['accept-encoding'] && request.headers['accept-encoding'].indexOf('deflate') != -1;
             var reply = deflate ? currentStatsCompressed : currentStats;
@@ -651,6 +1047,9 @@ var server = http.createServer(function(request, response){
             break;
         case '/stats_address':
             handleMinerStats(urlParts, response);
+            break;
+        case '/stats_worker':
+            handleWorkerStats(urlParts, response);
             break;
         case '/get_payments':
             handleGetPayments(urlParts, response);
@@ -687,7 +1086,18 @@ var server = http.createServer(function(request, response){
                 return;
             handleGetMinersHashrate(response);
             break;
-
+        case '/set_notification':
+            handleSetAddressEmail(urlParts, response);
+            break;
+          case '/get_notification':
+              handleGetAddressEmail(urlParts, response);
+              break;
+          case '/get_miner_payout_level':
+              handleGetMinerPayoutLevel(urlParts, response);
+              break;
+          case '/set_miner_payout_level':
+              handleSetMinerPayoutLevel(urlParts, response);
+              break;
         default:
             response.writeHead(404, {
                 'Access-Control-Allow-Origin': '*'
@@ -703,3 +1113,10 @@ initMonitoring();
 server.listen(config.api.port, function(){
     log('info', logSystem, 'API started & listening on port %d', [config.api.port]);
 });
+if(config.api.ssl == true)
+{
+    server2.listen(config.api.sslport, function(){
+        log('info', logSystem, 'API started & listening on port %d', [config.api.port]);
+    });
+}
+
